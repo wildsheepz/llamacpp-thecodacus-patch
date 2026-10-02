@@ -195,26 +195,24 @@ tokens_t engine::tokenize(const std::string & text, bool add_special) const {
 // Decode several prompts, each on its own sequence, packed into as few batches as n_batch allows.
 void engine::decode_parts(const std::vector<prompt_part> & parts) {
     const int n_batch = (int) llama_n_batch(ctx);
-    llama_batch batch = llama_batch_init(n_batch, 0, 1);
+    common_batch batch(ctx);
     auto flush = [&]() {
-        const int rc = batch.n_tokens > 0 ? llama_decode(ctx, batch) : 0;
-        common_batch_clear(batch);
+        const int rc = batch.size() > 0 ? llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) : 0;
+        batch.clear();
         if (rc != 0) {
-            llama_batch_free(batch);
             throw std::runtime_error(rc == 1 ? "no free KV cache space for the decision prompt"
                                              : "llama_decode failed on the decision prompt (" + std::to_string(rc) + ")");
         }
     };
     for (const auto & p : parts) {
         for (size_t i = 0; i < p.toks->size(); ++i) {
-            if (batch.n_tokens == n_batch) {
+            if (batch.size() == n_batch) {
                 flush();
             }
-            common_batch_add(batch, (*p.toks)[i], p.pos0 + (llama_pos) i, { p.seq }, false);
+            batch.add((*p.toks)[i], p.pos0 + (llama_pos) i, p.seq, false);
         }
     }
     flush();
-    llama_batch_free(batch);
 }
 
 // Restore (or build) the cached static prefix on seq_snap. Only this engine's own sequences are
@@ -271,7 +269,7 @@ std::vector<std::vector<float>> engine::score_branches(const std::vector<branch>
         if (end == start) {
             throw std::runtime_error("a decision suffix exceeds the batch size");
         }
-        llama_batch batch = llama_batch_init(rows, 0, 1);
+        common_batch batch(ctx);
         std::vector<int> out_idx;
         for (size_t k = start; k < end; ++k) {
             const auto &       br  = branches[order[k]];
@@ -282,13 +280,12 @@ std::vector<std::vector<float>> engine::score_branches(const std::vector<branch>
             for (int i = 0; i < n; ++i) {
                 const bool last = i + 1 == (int) br.toks.size();
                 if (last) {
-                    out_idx.push_back(batch.n_tokens);
+                    out_idx.push_back(batch.size());
                 }
-                common_batch_add(batch, br.toks[std::min(i, (int) br.toks.size() - 1)], br.pos0 + (llama_pos) i, { seq }, last);
+                batch.add(br.toks[std::min(i, (int) br.toks.size() - 1)], br.pos0 + (llama_pos) i, seq, last);
             }
         }
-        const int rc = llama_decode(ctx, batch);
-        llama_batch_free(batch);
+        const int rc = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (rc != 0) {
             throw std::runtime_error(rc == 1 ? "no free KV cache space for the decision branches"
                                              : "llama_decode failed on the decision branches (" + std::to_string(rc) + ")");

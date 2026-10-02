@@ -1,0 +1,638 @@
+name: CI Codacus patch build
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Upstream tag to base on (e.g. b11332; default: auto-detect latest bXXXX tag)'
+        required: false
+        type: string
+        default: ''
+      force_rebuild:
+        description: 'Force rebuild and push even if tag already exists on origin'
+        required: false
+        type: boolean
+        default: false
+  # push:
+  #   branches:
+  #     - patched
+
+  schedule:
+    # Rebuild daily rather than on every push because it is expensive
+    - cron: '12 4 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
+  cancel-in-progress: true
+
+# Fine-grant permission
+# https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#modifying-the-permissions-for-the-github_token
+permissions:
+  packages: write
+
+jobs:
+  create_tag:
+    name: Sync, cherry-pick and create tag
+    runs-on: ubuntu-slim
+    permissions:
+      contents: write
+    outputs:
+      source_tag: ${{ steps.sync_and_patch.outputs.source_tag }}
+      build_needed: ${{ steps.sync_and_patch.outputs.build_needed }}
+
+    steps:
+      - name: Checkout repository
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Sync remotes, cherry-pick commits and create tag
+        id: sync_and_patch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_UPSTREAM_TAG: ${{ inputs.upstream_tag || '' }}
+          INPUT_FORCE_REBUILD: ${{ inputs.force_rebuild || 'false' }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          echo "Configuring remotes..."
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream https://github.com/ggml-org/llama.cpp.git
+          else
+            git remote add upstream https://github.com/ggml-org/llama.cpp.git
+          fi
+
+          if git remote get-url codacus >/dev/null 2>&1; then
+            git remote set-url codacus https://github.com/thecodacus/llama.cpp.git
+          else
+            git remote add codacus https://github.com/thecodacus/llama.cpp.git
+          fi
+
+          echo "Fetching remotes..."
+          git fetch upstream master --tags
+          git fetch codacus parallel-decision
+          git fetch origin --tags
+
+          if [ -n "${INPUT_UPSTREAM_TAG}" ]; then
+            UPSTREAM_TAG="${INPUT_UPSTREAM_TAG}"
+            echo "Using specified upstream tag: ${UPSTREAM_TAG}"
+          else
+            UPSTREAM_TAG=$(git tag -l 'b[0-9]*' | grep -E '^b[0-9]+$' | sort -V | tail -n 1)
+            echo "Detected latest upstream tag: ${UPSTREAM_TAG}"
+          fi
+
+          if [ -z "${UPSTREAM_TAG}" ]; then
+            echo "Error: Could not determine upstream tag." >&2
+            exit 1
+          fi
+
+          TARGET_TAG="${UPSTREAM_TAG}-codacus"
+          echo "Target tag: ${TARGET_TAG}"
+          echo "source_tag=${TARGET_TAG}" >> "$GITHUB_OUTPUT"
+
+          TAG_EXISTS=false
+          if git ls-remote --tags origin "refs/tags/${TARGET_TAG}" | grep -q "${TARGET_TAG}"; then
+            TAG_EXISTS=true
+          fi
+
+          if [ "${TAG_EXISTS}" = "true" ] && [ "${INPUT_FORCE_REBUILD}" != "true" ]; then
+            echo "Tag ${TARGET_TAG} already exists on origin. Skipping build."
+            echo "build_needed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "build_needed=true" >> "$GITHUB_OUTPUT"
+
+          echo "Checking out upstream tag ${UPSTREAM_TAG} onto branch patched..."
+          git checkout -B patched "refs/tags/${UPSTREAM_TAG}"
+
+          echo "Finding commits unique to codacus/parallel-decision..."
+          COMMITS=$(git rev-list --reverse --no-merges upstream/master..codacus/parallel-decision)
+          if [ -z "${COMMITS}" ]; then
+            echo "No commits ahead of upstream/master found in codacus/parallel-decision."
+          else
+            echo "Cherry-picking commits:"
+            echo "${COMMITS}"
+            for commit in ${COMMITS}; do
+              echo "Cherry-picking ${commit}..."
+              if ! git cherry-pick "${commit}"; then
+                echo "Cherry-pick conflict on commit ${commit}!" >&2
+                git status >&2
+                git diff >&2
+                exit 1
+              fi
+            done
+          fi
+
+          echo "Tagging ${TARGET_TAG}..."
+          git tag -f "${TARGET_TAG}"
+
+          echo "Pushing patched branch and tag to origin..."
+          git push --force origin patched
+          git push --force origin "${TARGET_TAG}"
+
+  build_ui:
+    name: Build UI
+    needs: create_tag
+    if: needs.create_tag.outputs.build_needed == 'true'
+    uses: ./.github/workflows/ui-build.yml
+    with:
+      ui_version: ${{ needs.create_tag.outputs.source_tag }}
+
+  prepare_matrices:
+    name: Prepare Docker matrices
+    needs: create_tag
+    if: needs.create_tag.outputs.build_needed == 'true'
+    runs-on: ubuntu-24.04
+    outputs:
+      build_matrix: ${{ steps.matrices.outputs.build_matrix }}
+      merge_matrix: ${{ steps.matrices.outputs.merge_matrix }}
+
+    steps:
+      - name: Generate build and merge matrices
+        id: matrices
+        shell: bash
+        env:
+          SKIP_S390X: ${{ inputs.skip_s390x || 'false' }}
+        run: |
+          set -euo pipefail
+
+          # Keep all build targets in one place and derive merge targets from it.
+          cat > build-matrix.json <<'JSON'
+          [
+            { "tag": "vulkan", "dockerfile": ".devops/vulkan.Dockerfile", "platforms": "linux/amd64", "full": true, "light": true, "server": true, "free_disk_space": false, "runs_on": "ubuntu-24.04" }
+          ]
+          JSON
+
+          if [ "${SKIP_S390X}" = "true" ]; then
+            jq 'map(select(.platforms != "linux/s390x"))' build-matrix.json > build-matrix.json.tmp
+            mv build-matrix.json.tmp build-matrix.json
+          fi
+
+          BUILD_MATRIX="$(jq -c . build-matrix.json)"
+          MERGE_MATRIX="$(jq -c '
+            reduce .[] as $entry ({}; .[$entry.tag] |= (
+              . // {
+                tag: $entry.tag,
+                arches: [],
+                full: false,
+                light: false,
+                server: false
+              }
+              | .full = (.full or ($entry.full // false))
+              | .light = (.light or ($entry.light // false))
+              | .server = (.server or ($entry.server // false))
+              | .arches += [($entry.platforms | sub("^linux/"; ""))]
+            ))
+            # Backward compatibility: s390x tags are aliases of cpu for the linux/s390x platform.
+            | if (has("cpu") and (((.cpu.arches // []) | index("s390x")) != null)) then
+                . + {
+                  s390x: {
+                    tag: "s390x",
+                    arches: ["s390x"],
+                    full: .cpu.full,
+                    light: .cpu.light,
+                    server: .cpu.server
+                  }
+                }
+              else
+                .
+              end
+            | [.[] | .arches = (.arches | unique | sort | join(" "))]
+          ' build-matrix.json)"
+
+          echo "build_matrix=$BUILD_MATRIX" >> "$GITHUB_OUTPUT"
+          echo "merge_matrix=$MERGE_MATRIX" >> "$GITHUB_OUTPUT"
+
+  push_to_registry:
+    name: Push Docker image to Docker Registry
+    needs: [prepare_matrices, create_tag, build_ui]
+    if: needs.create_tag.outputs.build_needed == 'true'
+
+    runs-on: ${{ matrix.config.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        config: ${{ fromJSON(needs.prepare_matrices.outputs.build_matrix) }}
+    steps:
+      - name: Check out the repo
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.create_tag.outputs.source_tag }}
+
+      - name: Download prebuilt UI
+        if: ${{ matrix.config.prebuilt_ui == true }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: llama-ui.zip
+          path: tools/ui/dist
+
+      - name: Set up QEMU
+        if: ${{ contains(matrix.config.platforms, 'linux/amd64') }}
+        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a # v4
+        with:
+          image: tonistiigi/binfmt:qemu-v10.2.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Log in to Docker Registry
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine image metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPO_OWNER="${GITHUB_REPOSITORY_OWNER@L}"  # to lower case
+          REPO_NAME="${{ github.event.repository.name }}"
+          IMAGE_REPO="ghcr.io/${REPO_OWNER}/${REPO_NAME}"
+          PREFIX="${IMAGE_REPO}:"
+          PLATFORM="${{ matrix.config.platforms }}"
+          ARCH_SUFFIX="${PLATFORM#linux/}"
+
+          # list all tags possible
+          tags="${{ matrix.config.tag }}"
+          for tag in $tags; do
+              if [[ "$tag" == "cpu" ]]; then
+                  TYPE=""
+              else
+                  TYPE="-$tag"
+              fi
+              CACHETAG="${PREFIX}buildcache${TYPE}-${ARCH_SUFFIX}"
+          done
+
+          SAFE_TAGS="$(echo "$tags" | tr ' ' '_')"
+
+          echo "image_repo=$IMAGE_REPO" >> $GITHUB_OUTPUT
+          echo "arch_suffix=$ARCH_SUFFIX" >> $GITHUB_OUTPUT
+          echo "cache_output_tag=$CACHETAG" >> $GITHUB_OUTPUT
+          echo "digest_artifact_suffix=${SAFE_TAGS}-${ARCH_SUFFIX}" >> $GITHUB_OUTPUT
+          echo "cache_output_tag=$CACHETAG"  # print out for debugging
+        env:
+          GITHUB_REPOSITORY_OWNER: '${{ github.repository_owner }}'
+
+      - name: Get build date
+        id: build_date
+        run: echo "date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> $GITHUB_OUTPUT
+
+      - name: Free Disk Space (Ubuntu)
+        if: ${{ matrix.config.free_disk_space == true }}
+        uses: ggml-org/free-disk-space@v1.3.1
+        with:
+          # this might remove tools that are actually needed,
+          # if set to "true" but frees about 6 GB
+          tool-cache: false
+
+          # all of these default to true, but feel free to set to
+          # "false" if necessary for your workflow
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Build and push Full Docker image by digest
+        id: build_full
+        if: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && matrix.config.full == true }}
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
+        with:
+          context: .
+          platforms: ${{ matrix.config.platforms }}
+          outputs: type=image,name=${{ steps.meta.outputs.image_repo }},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=true
+          file: ${{ matrix.config.dockerfile }}
+          target: full
+          provenance: false
+          build-args: |
+            BUILD_DATE=${{ steps.build_date.outputs.date }}
+            APP_VERSION=${{ needs.create_tag.outputs.source_tag }}
+            APP_REVISION=${{ steps.checkout.outputs.commit }}
+            IMAGE_URL=${{ github.server_url }}/${{ github.repository }}
+            IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
+            ${{ matrix.config.ubuntu_version && format('UBUNTU_VERSION={0}', matrix.config.ubuntu_version) || '' }}
+            ${{ matrix.config.cuda_version && format('CUDA_VERSION={0}', matrix.config.cuda_version) || '' }}
+          annotations: |
+            manifest:org.opencontainers.image.created=${{ steps.build_date.outputs.date }}
+            manifest:org.opencontainers.image.version=${{ needs.create_tag.outputs.source_tag }}
+            manifest:org.opencontainers.image.revision=${{ steps.checkout.outputs.commit }}
+            manifest:org.opencontainers.image.title=llama.cpp
+            manifest:org.opencontainers.image.description=LLM inference in C/C++
+            manifest:org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
+            manifest:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          # using github experimental cache
+          #cache-from: type=gha
+          #cache-to: type=gha,mode=max
+          # return to this if the experimental github cache is having issues
+          #cache-to: type=local,dest=/tmp/.buildx-cache
+          #cache-from: type=local,src=/tmp/.buildx-cache
+          # using registry cache (no storage limit)
+          cache-from: type=registry,ref=${{ steps.meta.outputs.cache_output_tag }}
+          cache-to: type=registry,ref=${{ steps.meta.outputs.cache_output_tag }},mode=max
+
+      - name: Build and push Light Docker image by digest
+        id: build_light
+        if: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && matrix.config.light == true }}
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
+        with:
+          context: .
+          platforms: ${{ matrix.config.platforms }}
+          outputs: type=image,name=${{ steps.meta.outputs.image_repo }},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=true
+          file: ${{ matrix.config.dockerfile }}
+          target: light
+          provenance: false
+          build-args: |
+            BUILD_DATE=${{ steps.build_date.outputs.date }}
+            APP_VERSION=${{ needs.create_tag.outputs.source_tag }}
+            APP_REVISION=${{ steps.checkout.outputs.commit }}
+            IMAGE_URL=${{ github.server_url }}/${{ github.repository }}
+            IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
+            ${{ matrix.config.ubuntu_version && format('UBUNTU_VERSION={0}', matrix.config.ubuntu_version) || '' }}
+            ${{ matrix.config.cuda_version && format('CUDA_VERSION={0}', matrix.config.cuda_version) || '' }}
+          annotations: |
+            manifest:org.opencontainers.image.created=${{ steps.build_date.outputs.date }}
+            manifest:org.opencontainers.image.version=${{ needs.create_tag.outputs.source_tag }}
+            manifest:org.opencontainers.image.revision=${{ steps.checkout.outputs.commit }}
+            manifest:org.opencontainers.image.title=llama.cpp
+            manifest:org.opencontainers.image.description=LLM inference in C/C++
+            manifest:org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
+            manifest:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          # using github experimental cache
+          #cache-from: type=gha
+          #cache-to: type=gha,mode=max
+          # return to this if the experimental github cache is having issues
+          #cache-to: type=local,dest=/tmp/.buildx-cache
+          #cache-from: type=local,src=/tmp/.buildx-cache
+          # using registry cache (no storage limit)
+          cache-from: type=registry,ref=${{ steps.meta.outputs.cache_output_tag }}
+          cache-to: type=registry,ref=${{ steps.meta.outputs.cache_output_tag }},mode=max
+
+      - name: Build and push Server Docker image by digest
+        id: build_server
+        if: ${{ (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && matrix.config.server == true }}
+        uses: docker/build-push-action@d08e5c354a6adb9ed34480a06d141179aa583294 # v7
+        with:
+          context: .
+          platforms: ${{ matrix.config.platforms }}
+          outputs: type=image,name=${{ steps.meta.outputs.image_repo }},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=true
+          file: ${{ matrix.config.dockerfile }}
+          target: server
+          provenance: false
+          build-args: |
+            BUILD_DATE=${{ steps.build_date.outputs.date }}
+            APP_VERSION=${{ needs.create_tag.outputs.source_tag }}
+            APP_REVISION=${{ steps.checkout.outputs.commit }}
+            IMAGE_URL=${{ github.server_url }}/${{ github.repository }}
+            IMAGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
+            ${{ matrix.config.ubuntu_version && format('UBUNTU_VERSION={0}', matrix.config.ubuntu_version) || '' }}
+            ${{ matrix.config.cuda_version && format('CUDA_VERSION={0}', matrix.config.cuda_version) || '' }}
+          annotations: |
+            manifest:org.opencontainers.image.created=${{ steps.build_date.outputs.date }}
+            manifest:org.opencontainers.image.version=${{ needs.create_tag.outputs.source_tag }}
+            manifest:org.opencontainers.image.revision=${{ steps.checkout.outputs.commit }}
+            manifest:org.opencontainers.image.title=llama.cpp
+            manifest:org.opencontainers.image.description=LLM inference in C/C++
+            manifest:org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
+            manifest:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          # using github experimental cache
+          #cache-from: type=gha
+          #cache-to: type=gha,mode=max
+          # return to this if the experimental github cache is having issues
+          #cache-to: type=local,dest=/tmp/.buildx-cache
+          #cache-from: type=local,src=/tmp/.buildx-cache
+          # using registry cache (no storage limit)
+          cache-from: type=registry,ref=${{ steps.meta.outputs.cache_output_tag }}
+          cache-to: type=registry,ref=${{ steps.meta.outputs.cache_output_tag }},mode=max
+
+      - name: Export digest metadata
+        shell: bash
+        run: |
+            set -euo pipefail
+
+            TAGS="${{ matrix.config.tag }}"
+            ARCH_SUFFIX="${{ steps.meta.outputs.arch_suffix }}"
+            DIGEST_FILE="/tmp/digests/${{ steps.meta.outputs.digest_artifact_suffix }}.tsv"
+            mkdir -p /tmp/digests
+
+            add_digest_rows() {
+                local image_type="$1"
+                local digest="$2"
+
+                if [[ -z "$digest" ]]; then
+                  echo "Missing digest for image_type=${image_type}" >&2
+                  exit 1
+                fi
+
+                for tag in $TAGS; do
+                    printf '%s\t%s\t%s\t%s\n' "$tag" "$ARCH_SUFFIX" "$image_type" "$digest" >> "$DIGEST_FILE"
+                done
+            }
+
+            if [[ "${{ matrix.config.full }}" == "true" ]]; then
+                add_digest_rows "full" "${{ steps.build_full.outputs.digest }}"
+            fi
+
+            if [[ "${{ matrix.config.light }}" == "true" ]]; then
+                add_digest_rows "light" "${{ steps.build_light.outputs.digest }}"
+            fi
+
+            if [[ "${{ matrix.config.server }}" == "true" ]]; then
+                add_digest_rows "server" "${{ steps.build_server.outputs.digest }}"
+            fi
+
+      - name: Upload digest metadata
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: digests-${{ steps.meta.outputs.digest_artifact_suffix }}
+          path: /tmp/digests/${{ steps.meta.outputs.digest_artifact_suffix }}.tsv
+          if-no-files-found: error
+
+  merge_arch_tags:
+    name: Create shared tags from digests
+    needs: [prepare_matrices, push_to_registry, create_tag]
+    if: needs.create_tag.outputs.build_needed == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        config: ${{ fromJSON(needs.prepare_matrices.outputs.merge_matrix) }}
+
+    steps:
+      - name: Check out the repo
+        id: checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.create_tag.outputs.source_tag }}
+
+      - name: Get build date
+        id: build_date
+        run: echo "date=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> $GITHUB_OUTPUT
+
+      - name: Download digest metadata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: digests-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4
+
+      - name: Log in to Docker Registry
+        uses: docker/login-action@b45d80f862d83dbcd57f89517bcf500b2ab88fb2 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create tags from digests
+        id: create_tags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPO_OWNER="${GITHUB_REPOSITORY_OWNER@L}"  # to lower case
+          REPO_NAME="${{ github.event.repository.name }}"
+          IMAGE_REPO="ghcr.io/${REPO_OWNER}/${REPO_NAME}"
+          PREFIX="${IMAGE_REPO}:"
+          SRC_TAG="${{ needs.create_tag.outputs.source_tag }}"
+          BUILD_DATE="${{ steps.build_date.outputs.date }}"
+          COMMIT_SHA="${{ steps.checkout.outputs.commit }}"
+          echo "image_repo=${IMAGE_REPO}" >> "$GITHUB_OUTPUT"
+          TAGS="${{ matrix.config.tag }}"
+          ARCHES="${{ matrix.config.arches }}"
+          DIGEST_GLOB="/tmp/digests/*.tsv"
+
+          if ! ls ${DIGEST_GLOB} >/dev/null 2>&1; then
+              echo "No digest metadata found in /tmp/digests" >&2
+              exit 1
+          fi
+
+          if [[ -z "$SRC_TAG" ]]; then
+              echo "Missing source tag from create_tag" >&2
+              exit 1
+          fi
+
+          find_digest() {
+              local tag_name="$1"
+              local arch="$2"
+              local image_type="$3"
+              local digest
+
+              digest="$(awk -F '\t' -v t="$tag_name" -v a="$arch" -v i="$image_type" '$1 == t && $2 == a && $3 == i { print $4; exit }' ${DIGEST_GLOB})"
+
+              # Backward compatibility: s390x tags are aliases of cpu for the linux/s390x platform.
+              if [[ -z "$digest" && "$tag_name" == "s390x" && "$arch" == "s390x" ]]; then
+                digest="$(awk -F '\t' -v t="cpu" -v a="$arch" -v i="$image_type" '$1 == t && $2 == a && $3 == i { print $4; exit }' ${DIGEST_GLOB})"
+              fi
+
+              if [[ -z "$digest" ]]; then
+                echo "Missing digest for tag=${tag_name} arch=${arch} image_type=${image_type}" >&2
+                exit 1
+              fi
+
+              echo "$digest"
+          }
+
+          create_manifest_tags() {
+              local image_type="$1"
+              local tag_name="$2"
+              local suffix="$3"
+
+              local merged_tag="${PREFIX}${image_type}${suffix}"
+              local merged_versioned_tag="${merged_tag}-${SRC_TAG}"
+
+              local refs=()
+
+              for arch in $ARCHES; do
+                  local digest
+                  digest="$(find_digest "$tag_name" "$arch" "$image_type")"
+                  refs+=("${IMAGE_REPO}@${digest}")
+              done
+
+              local annotations=(
+                  --annotation "index:org.opencontainers.image.created=${BUILD_DATE}"
+                  --annotation "index:org.opencontainers.image.version=${SRC_TAG}"
+                  --annotation "index:org.opencontainers.image.revision=${COMMIT_SHA}"
+                  --annotation "index:org.opencontainers.image.title=llama.cpp"
+                  --annotation "index:org.opencontainers.image.description=LLM inference in C/C++"
+                  --annotation "index:org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}"
+                  --annotation "index:org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
+              )
+
+              echo "Creating ${merged_tag} from ${refs[*]}"
+              docker buildx imagetools create "${annotations[@]}" --tag "${merged_tag}" "${refs[@]}"
+
+              echo "Creating ${merged_versioned_tag} from ${refs[*]}"
+              docker buildx imagetools create "${annotations[@]}" --tag "${merged_versioned_tag}" "${refs[@]}"
+
+              if [[ "$tag_name" == "${TAGS%% *}" ]]; then
+                  local digest
+                  digest="$(docker buildx imagetools inspect "${merged_versioned_tag}" --format '{{.Manifest.Digest}}')"
+                  if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                      echo "Invalid digest for ${merged_versioned_tag}: ${digest}" >&2
+                      exit 1
+                  fi
+                  echo "${image_type}_digest=${digest}" >> "$GITHUB_OUTPUT"
+              fi
+          }
+
+          for tag in $TAGS; do
+              if [[ "$tag" == "cpu" ]]; then
+                  TYPE=""
+              else
+                  TYPE="-$tag"
+              fi
+
+              if [[ "${{ matrix.config.full }}" == "true" ]]; then
+                  create_manifest_tags "full" "$tag" "$TYPE"
+              fi
+
+              if [[ "${{ matrix.config.light }}" == "true" ]]; then
+                  create_manifest_tags "light" "$tag" "$TYPE"
+              fi
+
+              if [[ "${{ matrix.config.server }}" == "true" ]]; then
+                  create_manifest_tags "server" "$tag" "$TYPE"
+              fi
+          done
+        env:
+          GITHUB_REPOSITORY_OWNER: '${{ github.repository_owner }}'
+
+      - name: Attest full image
+        if: ${{ matrix.config.full }}
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ steps.create_tags.outputs.image_repo }}
+          subject-digest: ${{ steps.create_tags.outputs.full_digest }}
+
+      - name: Attest light image
+        if: ${{ matrix.config.light }}
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ steps.create_tags.outputs.image_repo }}
+          subject-digest: ${{ steps.create_tags.outputs.light_digest }}
+
+      - name: Attest server image
+        if: ${{ matrix.config.server }}
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ steps.create_tags.outputs.image_repo }}
+          subject-digest: ${{ steps.create_tags.outputs.server_digest }}

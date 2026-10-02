@@ -19,7 +19,7 @@ on:
 
   schedule:
     # Rebuild daily rather than on every push because it is expensive
-    - cron: '12 4 * * *'
+    - cron: '0 18 * * *'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
@@ -107,6 +107,11 @@ jobs:
 
           echo "build_needed=true" >> "$GITHUB_OUTPUT"
 
+          mkdir -p /tmp/patches
+          if [ -d .github/patches ]; then
+            cp -r .github/patches/* /tmp/patches/ 2>/dev/null || true
+          fi
+
           echo "Checking out upstream tag ${UPSTREAM_TAG} onto branch patched..."
           git checkout -B patched "refs/tags/${UPSTREAM_TAG}"
 
@@ -126,6 +131,19 @@ jobs:
                 exit 1
               fi
             done
+          fi
+
+          echo "Applying additional patches..."
+          if [ -d /tmp/patches ] && compgen -G "/tmp/patches/*.patch" > /dev/null; then
+            for patch_file in /tmp/patches/*.patch; do
+              echo "Applying ${patch_file}..."
+              git apply "${patch_file}"
+              git commit -a -m "apply $(basename "${patch_file}")"
+            done
+          elif git show origin/ci:.github/patches/parallel-decision-batch-ext.patch >/dev/null 2>&1; then
+            echo "Applying patch from origin/ci..."
+            git show origin/ci:.github/patches/parallel-decision-batch-ext.patch | git apply
+            git commit -a -m "apply parallel-decision-batch-ext.patch"
           fi
 
           echo "Tagging ${TARGET_TAG}..."
